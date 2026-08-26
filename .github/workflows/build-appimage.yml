@@ -57,7 +57,8 @@ jobs:
           TAG="${{ steps.upstream.outputs.tag }}"
           FILE="MeshcoreOpen-x86_64.AppImage"
           test -f "$FILE"
-          gh release create "$TAG" "$FILE" \
+          test -f "${FILE}.zsync"
+          gh release create "$TAG" "$FILE" "${FILE}.zsync" \
             --repo "${{ github.repository }}" \
             --title "MeshCore Open $TAG" \
             --notes "AppImage built from zjs81/meshcore-open release \`$TAG\`."
