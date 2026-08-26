@@ -2,12 +2,11 @@ name: Build MeshCore Open AppImage
 
 on:
   schedule:
-    # Mondays 06:00 UTC (~ weekly)
     - cron: "0 6 * * 1"
-  workflow_dispatch: # "Run workflow" button in the UI
+  workflow_dispatch:
 
 permissions:
-  contents: write # needed to create releases / upload assets
+  contents: write
 
 jobs:
   build-and-release:
@@ -59,5 +58,6 @@ jobs:
           FILE="MeshcoreOpen-x86_64.AppImage"
           test -f "$FILE"
           gh release create "$TAG" "$FILE" \
+            --repo "${{ github.repository }}" \
             --title "MeshCore Open $TAG" \
             --notes "AppImage built from zjs81/meshcore-open release \`$TAG\`."
