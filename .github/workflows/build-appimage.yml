@@ -1,0 +1,63 @@
+name: Build MeshCore Open AppImage
+
+on:
+  schedule:
+    # Mondays 06:00 UTC (~ weekly)
+    - cron: "0 6 * * 1"
+  workflow_dispatch: # "Run workflow" button in the UI
+
+permissions:
+  contents: write # needed to create releases / upload assets
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Get latest upstream release tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh api repos/zjs81/meshcore-open/releases/latest --jq .tag_name)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest tag: $TAG"
+
+      - name: Check if we already released this tag
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.upstream.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Already have release ${{ steps.upstream.outputs.tag }}; skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No release for ${{ steps.upstream.outputs.tag }}; will build."
+          fi
+
+      - name: Install build deps
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip fuse libfuse2 python3
+
+      - name: Build AppImage
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          chmod +x build-appimage.sh
+          ./build-appimage.sh
+
+      - name: Publish GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          FILE="MeshcoreOpen-x86_64.AppImage"
+          test -f "$FILE"
+          gh release create "$TAG" "$FILE" \
+            --title "MeshCore Open $TAG" \
+            --notes "AppImage built from zjs81/meshcore-open release \`$TAG\`."
