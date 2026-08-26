@@ -14,9 +14,15 @@ VERSION="${VERSION:-1.0.0}"
 ARCH="${ARCH:-x86_64}"
 GITHUB_REPO="${GITHUB_REPO:-zjs81/meshcore-open}"
 GITHUB_ASSET_PATTERN="${GITHUB_ASSET_PATTERN:-linux.*\.(zip|tar\.gz|tgz)$}"
+# Where YOUR AppImages are published (for Gear Lever auto-updates)
+PUBLISH_OWNER="${PUBLISH_OWNER:-ilikehamradio}"
+PUBLISH_REPO="${PUBLISH_REPO:-MeshCore-Open-AppImage-Builder}"
 
 APPDIR="${SCRIPT_DIR}/${APP_NAME}.AppDir"
 APPIMAGE_TOOL="${SCRIPT_DIR}/appimagetool-${ARCH}.AppImage"
+OUTPUT_NAME="${APP_NAME}-${ARCH}.AppImage"
+ZSYNC_NAME="${OUTPUT_NAME}.zsync"
+UPDATE_INFO="gh-releases-zsync|${PUBLISH_OWNER}|${PUBLISH_REPO}|latest|${APP_NAME}-*${ARCH}.AppImage.zsync"
 ICON_FILE=""
 
 require_file() {
@@ -40,20 +46,17 @@ download_appimagetool() {
 
 cleanup_workspace() {
   local script_name
-  local output_name
   local path
 
   script_name="$(basename "${BASH_SOURCE[0]}")"
-  output_name="${APP_NAME}-${ARCH}.AppImage"
 
   shopt -s dotglob nullglob
   for path in "${SCRIPT_DIR}"/*; do
-    if [[ "$(basename "${path}")" == "${script_name}" ]]; then
-      continue
-    fi
-    if [[ "$(basename "${path}")" == "${output_name}" ]]; then
-      continue
-    fi
+    case "$(basename "${path}")" in
+      "${script_name}"|"${OUTPUT_NAME}"|"${ZSYNC_NAME}")
+        continue
+        ;;
+    esac
     rm -rf "${path}"
   done
   shopt -u dotglob nullglob
@@ -244,11 +247,20 @@ EOF
 
   download_appimagetool
 
-  echo "Building AppImage..."
+  echo "Building AppImage with update info: ${UPDATE_INFO}"
   # Use extract-and-run so appimagetool works on systems without FUSE.
-  ARCH="${ARCH}" APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGE_TOOL}" "${APPDIR}"
+  # -u embeds .upd_info so Gear Lever can auto-detect updates.
+  ARCH="${ARCH}" APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGE_TOOL}" \
+    -u "${UPDATE_INFO}" \
+    "${APPDIR}"
+
+  require_file "${SCRIPT_DIR}/${OUTPUT_NAME}"
+  require_file "${SCRIPT_DIR}/${ZSYNC_NAME}"
+
   cleanup_workspace
-  echo "Done. AppImage created in: ${SCRIPT_DIR}"
+  echo "Done. Created:"
+  echo "  ${SCRIPT_DIR}/${OUTPUT_NAME}"
+  echo "  ${SCRIPT_DIR}/${ZSYNC_NAME}"
 }
 
 main "$@"
