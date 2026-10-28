@@ -7,15 +7,23 @@ set -euo pipefail
 # Example:
 #   ./build-appimage.sh MeshcoreOpen meshcore_open
 #
+# Builds from upstream MeshCore Open source (not a prebuilt zip):
+#   1. Clone GITHUB_REPO @ UPSTREAM_TAG (or latest release tag)
+#   2. strip_nags.py patch-sources (shop banner + map contribute prompt)
+#   3. flutter build linux --release
+#   4. Bundle onnxruntime if missing, package AppImage
+#
+# Requires: flutter on PATH (or FLUTTER_ROOT), git, python3, AppImage deps.
+#
 # Optional env overrides:
 #   VERSION=1.0.0
 #   ARCH=x86_64
 #   GITHUB_REPO=zjs81/meshcore-open
-#   GITHUB_ASSET_PATTERN='linux.*\.(zip|tar\.gz|tgz)$'
 #   PUBLISH_OWNER=ilikehamradio
 #   PUBLISH_REPO=MeshCore-Open-AppImage-Builder
 #   ONNXRUNTIME_VERSION=1.28.3   # auto-detected from plugin when possible
 #   SKIP_DEP_VERIFY=1            # skip post-bundle ldd gate
+#   UPSTREAM_TAG=BETA-99.0.0     # pin upstream git tag/release
 #
 # Audit of ~/AppImages/meshcoreopen.appimage (2026-10-28):
 #   Hard startup miss: libonnxruntime.so.1 (flutter_onnxruntime → 1.28.3)
@@ -29,13 +37,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="${VERSION:-1.0.0}"
 ARCH="${ARCH:-x86_64}"
 GITHUB_REPO="${GITHUB_REPO:-zjs81/meshcore-open}"
-GITHUB_ASSET_PATTERN="${GITHUB_ASSET_PATTERN:-linux.*\.(zip|tar\.gz|tgz)$}"
 # Where YOUR AppImages are published (for Gear Lever auto-updates)
 PUBLISH_OWNER="${PUBLISH_OWNER:-ilikehamradio}"
 PUBLISH_REPO="${PUBLISH_REPO:-MeshCore-Open-AppImage-Builder}"
 # flutter_onnxruntime currently vendors 1.28.3; override if upstream bumps it.
 ONNXRUNTIME_VERSION="${ONNXRUNTIME_VERSION:-}"
 SKIP_DEP_VERIFY="${SKIP_DEP_VERIFY:-0}"
+UPSTREAM_TAG="${UPSTREAM_TAG:-}"
+STRIP_NAGS_PY="${SCRIPT_DIR}/strip_nags.py"
 
 APPDIR="${SCRIPT_DIR}/${APP_NAME}.AppDir"
 APPIMAGE_TOOL="${SCRIPT_DIR}/appimagetool-${ARCH}.AppImage"
@@ -76,131 +85,13 @@ cleanup_workspace() {
   shopt -s dotglob nullglob
   for path in "${SCRIPT_DIR}"/*; do
     case "$(basename "${path}")" in
-      "${script_name}"|"${OUTPUT_NAME}"|"${ZSYNC_NAME}")
+      "${script_name}"|"${OUTPUT_NAME}"|"${ZSYNC_NAME}"|strip_nags.py|test_strip_nags.py|test-impact-map.json|LICENSE|.git|.github)
         continue
         ;;
     esac
     rm -rf "${path}"
   done
   shopt -u dotglob nullglob
-}
-
-download_latest_linux_bundle() {
-  local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=10"
-  local release_json
-  local asset_info
-  local asset_name
-  local asset_url
-  local download_path
-  local extract_dir
-  local bundle_root
-  local curl_auth=()
-
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    curl_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-  fi
-
-  echo "Fetching recent release metadata from: ${api_url}"
-  release_json="$(curl -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: appimage-builder" "${curl_auth[@]}" "${api_url}")"
-
-  asset_info="$(
-    python3 -c '
-import json
-import re
-import sys
-
-data = json.load(sys.stdin)
-if isinstance(data, dict) and data.get("message"):
-    msg = data.get("message", "GitHub API error")
-    print(f"ERROR::{msg}")
-    raise SystemExit(0)
-
-if isinstance(data, dict):
-    releases = [data]
-else:
-    releases = data
-
-patterns = [
-    r"linux.*(x86_64|amd64).*\.(zip|tar\.gz|tgz)$",
-    r"(x86_64|amd64).*linux.*\.(zip|tar\.gz|tgz)$",
-    r"linux-release\.(zip|tar\.gz|tgz)$",
-    sys.argv[1],
-    r"linux.*\.(zip|tar\.gz|tgz)$",
-]
-
-for pattern in patterns:
-    regex = re.compile(pattern, re.IGNORECASE)
-    for release in releases:
-        for asset in release.get("assets", []):
-            name = asset.get("name", "")
-            if regex.search(name):
-                print(name)
-                print(asset.get("browser_download_url", ""))
-                raise SystemExit(0)
-' "${GITHUB_ASSET_PATTERN}" <<< "${release_json}"
-  )"
-
-  if [[ "${asset_info}" == ERROR::* ]]; then
-    echo "GitHub API returned an error for ${GITHUB_REPO}: ${asset_info#ERROR::}" >&2
-    echo "If you hit API limits, try again later or set GITHUB_TOKEN for authenticated requests." >&2
-    exit 1
-  fi
-
-  if [[ -z "${asset_info}" ]]; then
-    echo "No Linux build asset found across recent releases for ${GITHUB_REPO}." >&2
-    echo "Current pattern: ${GITHUB_ASSET_PATTERN}" >&2
-    echo "You can override it with GITHUB_ASSET_PATTERN='<regex>'." >&2
-    exit 1
-  fi
-
-  mapfile -t _asset_lines <<< "${asset_info}"
-  asset_name="${_asset_lines[0]}"
-  asset_url="${_asset_lines[1]}"
-
-  if [[ -z "${asset_url}" ]]; then
-    echo "Latest release asset URL is empty for ${GITHUB_REPO}." >&2
-    exit 1
-  fi
-
-  download_path="${SCRIPT_DIR}/.latest-linux-build-${asset_name}"
-  extract_dir="${SCRIPT_DIR}/.latest-linux-build"
-  rm -rf "${extract_dir}" "${download_path}"
-  mkdir -p "${extract_dir}"
-
-  echo "Downloading latest Linux bundle: ${asset_name}"
-  curl -fL "${asset_url}" -o "${download_path}"
-
-  case "${asset_name}" in
-    *.zip)
-      unzip -q "${download_path}" -d "${extract_dir}"
-      ;;
-    *.tar.gz|*.tgz)
-      tar -xzf "${download_path}" -C "${extract_dir}"
-      ;;
-    *)
-      echo "Unsupported asset format for ${asset_name}; expected .zip or .tar.gz/.tgz" >&2
-      exit 1
-      ;;
-  esac
-
-  bundle_root="$(
-    find "${extract_dir}" -type f -name "${EXECUTABLE}" -printf '%h\n' \
-      | while IFS= read -r path; do
-          if [[ -d "${path}/data" && -d "${path}/lib" ]]; then
-            printf '%s\n' "${path}"
-            break
-          fi
-        done
-  )"
-
-  if [[ -z "${bundle_root}" ]]; then
-    echo "Could not locate ${EXECUTABLE} with sibling data/ and lib/ in ${asset_name}" >&2
-    exit 1
-  fi
-
-  cp -a "${bundle_root}/${EXECUTABLE}" "${SCRIPT_DIR}/${EXECUTABLE}"
-  cp -a "${bundle_root}/data" "${SCRIPT_DIR}/data"
-  cp -a "${bundle_root}/lib" "${SCRIPT_DIR}/lib"
 }
 
 detect_onnxruntime_version() {
@@ -379,13 +270,89 @@ resolve_icon() {
   echo "No icon found on GitHub or locally; continuing without icon."
 }
 
+resolve_upstream_tag() {
+  local curl_auth=()
+  local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+  local tag
+
+  if [[ -n "${UPSTREAM_TAG}" ]]; then
+    echo "${UPSTREAM_TAG}"
+    return
+  fi
+
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    curl_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+
+  tag="$(
+    curl -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: appimage-builder" \
+      "${curl_auth[@]}" "${api_url}" \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])'
+  )"
+  if [[ -z "${tag}" ]]; then
+    echo "Could not resolve latest upstream tag for ${GITHUB_REPO}" >&2
+    exit 1
+  fi
+  echo "${tag}"
+}
+
+build_from_patched_source() {
+  local tag="$1"
+  local src_dir="${SCRIPT_DIR}/.upstream-src"
+  local bundle_dir
+  local flutter_bin="${FLUTTER_ROOT:+${FLUTTER_ROOT}/bin/flutter}"
+
+  if [[ -z "${flutter_bin}" ]]; then
+    flutter_bin="$(command -v flutter || true)"
+  fi
+  if [[ -z "${flutter_bin}" ]]; then
+    echo "flutter is required on PATH (or set FLUTTER_ROOT)" >&2
+    exit 1
+  fi
+
+  require_file "${STRIP_NAGS_PY}"
+
+  rm -rf "${src_dir}"
+  echo "Cloning ${GITHUB_REPO}@${tag} ..."
+  git clone --depth 1 --branch "${tag}" "https://github.com/${GITHUB_REPO}.git" "${src_dir}"
+
+  echo "Stripping shop banner + map contribute prompt from sources..."
+  python3 "${STRIP_NAGS_PY}" patch-sources "${src_dir}"
+
+  (
+    cd "${src_dir}"
+    "${flutter_bin}" pub get
+    "${flutter_bin}" build linux --release --no-pub
+  )
+
+  bundle_dir="${src_dir}/build/linux/x64/release/bundle"
+  if [[ ! -d "${bundle_dir}" ]]; then
+    bundle_dir="$(find "${src_dir}/build/linux" -type d -path '*/release/bundle' | head -n1 || true)"
+  fi
+  if [[ -z "${bundle_dir}" || ! -d "${bundle_dir}" ]]; then
+    echo "flutter build linux did not produce a release bundle" >&2
+    exit 1
+  fi
+
+  rm -rf "${SCRIPT_DIR}/data" "${SCRIPT_DIR}/lib" "${SCRIPT_DIR}/${EXECUTABLE}"
+  cp -a "${bundle_dir}/${EXECUTABLE}" "${SCRIPT_DIR}/${EXECUTABLE}"
+  cp -a "${bundle_dir}/data" "${SCRIPT_DIR}/data"
+  cp -a "${bundle_dir}/lib" "${SCRIPT_DIR}/lib"
+}
+
 write_apprun() {
   # LD_LIBRARY_PATH covers bundled libs (incl. onnxruntime).
   # JVM probe is for optional dartjni features — we do not ship a JRE.
+  # Before launch, force network-map upload off and mark the opt-in prompt shown.
   cat > "${APPDIR}/AppRun" <<EOF
 #!/usr/bin/env bash
 HERE="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 export LD_LIBRARY_PATH="\$HERE/lib:\${LD_LIBRARY_PATH:-}"
+
+# Never contribute to the public network map; never re-prompt.
+if [[ -f "\$HERE/strip_nags.py" ]]; then
+  python3 "\$HERE/strip_nags.py" force-map-prefs >/dev/null 2>&1 || true
+fi
 
 # Optional JNI (libdartjni.so → libjvm.so). Prefer an existing host JDK.
 _jvm_candidates=()
@@ -415,7 +382,7 @@ EOF
 
 main() {
   rm -rf "${SCRIPT_DIR}/data" "${SCRIPT_DIR}/lib" "${SCRIPT_DIR}/${EXECUTABLE}"
-  download_latest_linux_bundle
+  build_from_patched_source "$(resolve_upstream_tag)"
 
   require_file "${SCRIPT_DIR}/${EXECUTABLE}"
   require_file "${SCRIPT_DIR}/data"
@@ -432,6 +399,7 @@ main() {
   cp -a "${SCRIPT_DIR}/${EXECUTABLE}" "${APPDIR}/"
   cp -a "${SCRIPT_DIR}/data" "${APPDIR}/"
   cp -a "${SCRIPT_DIR}/lib" "${APPDIR}/"
+  cp -a "${STRIP_NAGS_PY}" "${APPDIR}/strip_nags.py"
 
   write_apprun
 

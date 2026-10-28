@@ -1,0 +1,4 @@
+{
+  "strip_nags.py": ["test_strip_nags.py"],
+  "build-appimage.sh": ["test_strip_nags.py"]
+}
