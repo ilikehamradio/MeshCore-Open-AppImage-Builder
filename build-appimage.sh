@@ -15,6 +15,13 @@ set -euo pipefail
 #   PUBLISH_OWNER=ilikehamradio
 #   PUBLISH_REPO=MeshCore-Open-AppImage-Builder
 #   ONNXRUNTIME_VERSION=1.28.3   # auto-detected from plugin when possible
+#   SKIP_DEP_VERIFY=1            # skip post-bundle ldd gate
+#
+# Audit of ~/AppImages/meshcoreopen.appimage (2026-10-28):
+#   Hard startup miss: libonnxruntime.so.1 (flutter_onnxruntime → 1.28.3)
+#   Soft/lazy miss:    libjvm.so (libdartjni.so; NOT in binary DT_NEEDED)
+#   Everything else (GTK/Vulkan/ggml/llama/LiteRt/dawn) resolves from
+#   the bundle + normal host libs.
 
 APP_NAME="${1:-MeshcoreOpen}"
 EXECUTABLE="${2:-meshcore_open}"
@@ -28,6 +35,7 @@ PUBLISH_OWNER="${PUBLISH_OWNER:-ilikehamradio}"
 PUBLISH_REPO="${PUBLISH_REPO:-MeshCore-Open-AppImage-Builder}"
 # flutter_onnxruntime currently vendors 1.28.3; override if upstream bumps it.
 ONNXRUNTIME_VERSION="${ONNXRUNTIME_VERSION:-}"
+SKIP_DEP_VERIFY="${SKIP_DEP_VERIFY:-0}"
 
 APPDIR="${SCRIPT_DIR}/${APP_NAME}.AppDir"
 APPIMAGE_TOOL="${SCRIPT_DIR}/appimagetool-${ARCH}.AppImage"
@@ -35,6 +43,10 @@ OUTPUT_NAME="${APP_NAME}-${ARCH}.AppImage"
 ZSYNC_NAME="${OUTPUT_NAME}.zsync"
 UPDATE_INFO="gh-releases-zsync|${PUBLISH_OWNER}|${PUBLISH_REPO}|latest|${APP_NAME}-*${ARCH}.AppImage.zsync"
 ICON_FILE=""
+
+# System libs we expect from the host (do NOT fail the build if ldd finds these).
+# Everything else that remains "not found" after bundling is a packaging bug.
+HOST_OK_LIBS_REGEX='^(ld-linux-x86-64\.so\.2|libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6|libz\.so\.1|libgtk-3\.so\.0|libgdk-3\.so\.0|libgdk_pixbuf-2\.0\.so\.0|libglib-2\.0\.so\.0|libgobject-2\.0\.so\.0|libgio-2\.0\.so\.0|libpango-1\.0\.so\.0|libpangocairo-1\.0\.so\.0|libcairo\.so\.2|libcairo-gobject\.so\.2|libatk-1\.0\.so\.0|libharfbuzz\.so\.0|libfontconfig\.so\.1|libepoxy\.so\.0|libvulkan\.so\.1|libX11\.so\.6|libXext\.so\.6|libXi\.so\.6|libXcursor\.so\.1|libXdamage\.so\.1|libXfixes\.so\.3|libXrandr\.so\.2|libXinerama\.so\.1|libXcomposite\.so\.1|libxkbcommon\.so\.0|libwayland-client\.so\.0|libwayland-cursor\.so\.0|libwayland-egl\.so\.1|libdbus-1\.so\.3|libpcre2?-8\.so\.0|libffi\.so\.8|libselinux\.so\.1|libmount\.so\.1|libblkid\.so\.1|libuuid\.so\.1|libpng16\.so\.16|libjpeg\.so\.8|libfreetype\.so\.6|libfribidi\.so\.0|libthai\.so\.0|libdatrie\.so\.1|libgraphite2\.so\.3|libpixman-1\.so\.0|libxcb.*|libjvm\.so)$'
 
 require_file() {
   local path="$1"
@@ -82,9 +94,14 @@ download_latest_linux_bundle() {
   local download_path
   local extract_dir
   local bundle_root
+  local curl_auth=()
+
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    curl_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
 
   echo "Fetching recent release metadata from: ${api_url}"
-  release_json="$(curl -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: appimage-builder" "${api_url}")"
+  release_json="$(curl -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: appimage-builder" "${curl_auth[@]}" "${api_url}")"
 
   asset_info="$(
     python3 -c '
@@ -198,9 +215,17 @@ detect_onnxruntime_version() {
   if [[ -f "${plugin}" ]] && command -v strings >/dev/null 2>&1; then
     detected="$(
       strings "${plugin}" \
-        | sed -n 's/.*onnxruntime-linux-x64-\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+        | sed -n 's/.*onnxruntime-linux-[^/]*-\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
         | head -n1
     )"
+    if [[ -z "${detected}" ]]; then
+      # OrtGetApiBase@VERS_1.28.3 style
+      detected="$(
+        strings "${plugin}" \
+          | sed -n 's/.*VERS_\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+          | head -n1
+      )"
+    fi
   fi
 
   if [[ -z "${detected}" ]]; then
@@ -273,6 +298,55 @@ ensure_onnxruntime_libs() {
   ls -l "${lib_dir}"/libonnxruntime.so* "${lib_dir}"/libonnxruntime_providers_shared.so 2>/dev/null || true
 }
 
+# Fail the build if the AppDir still has non-host missing libs on the
+# hard startup chain (binary + its DT_NEEDED plugins). libjvm is excluded
+# because dartjni is not linked into the binary; AppRun probes a host JDK.
+verify_appdir_deps() {
+  local appdir="$1"
+  local lib_dir="${appdir}/lib"
+  local binary="${appdir}/${EXECUTABLE}"
+  local missing
+
+  if [[ "${SKIP_DEP_VERIFY}" == "1" ]]; then
+    echo "SKIP_DEP_VERIFY=1; skipping dependency verification"
+    return
+  fi
+
+  require_file "${binary}"
+  require_file "${lib_dir}"
+
+  echo "Verifying shared-library closure for ${binary} ..."
+  missing="$(
+    LD_LIBRARY_PATH="${lib_dir}" ldd "${binary}" 2>/dev/null \
+      | awk '/not found/ {print $1}' \
+      | sort -u \
+      | while IFS= read -r lib; do
+          [[ -z "${lib}" ]] && continue
+          if [[ "${lib}" =~ ${HOST_OK_LIBS_REGEX} ]]; then
+            continue
+          fi
+          printf '%s\n' "${lib}"
+        done
+  )"
+
+  if [[ -n "${missing}" ]]; then
+    echo "AppDir still missing libraries required at startup:" >&2
+    printf '  %s\n' ${missing} >&2
+    echo "Bundle them in ensure_* helpers before packaging." >&2
+    exit 1
+  fi
+
+  if [[ -f "${lib_dir}/libflutter_onnxruntime_plugin.so" ]]; then
+    require_file "${lib_dir}/libonnxruntime.so.1"
+  fi
+
+  echo "Dependency verification passed (startup chain)."
+  if [[ -f "${lib_dir}/libdartjni.so" ]]; then
+    echo "Note: libdartjni.so needs libjvm.so at runtime for JNI features;"
+    echo "      AppRun will probe JAVA_HOME / /usr/lib/jvm/*/lib/server (not bundled)."
+  fi
+}
+
 resolve_icon() {
   # Prefer the exact project icon from GitHub.
   local candidates=(
@@ -290,6 +364,12 @@ resolve_icon() {
   done
 
   # Fallback: local icon from the extracted Linux bundle.
+  if [[ -f "${SCRIPT_DIR}/data/flutter_assets/assets/images/mesh-icon.png" ]]; then
+    ICON_FILE="${SCRIPT_DIR}/data/flutter_assets/assets/images/mesh-icon.png"
+    echo "Using local bundle icon: ${ICON_FILE}"
+    return
+  fi
+
   if [[ -f "${SCRIPT_DIR}/data/flutter_assets/assets/icons/done_all.svg" ]]; then
     ICON_FILE="${SCRIPT_DIR}/data/flutter_assets/assets/icons/done_all.svg"
     echo "Using local bundle icon: ${ICON_FILE}"
@@ -297,6 +377,40 @@ resolve_icon() {
   fi
 
   echo "No icon found on GitHub or locally; continuing without icon."
+}
+
+write_apprun() {
+  # LD_LIBRARY_PATH covers bundled libs (incl. onnxruntime).
+  # JVM probe is for optional dartjni features — we do not ship a JRE.
+  cat > "${APPDIR}/AppRun" <<EOF
+#!/usr/bin/env bash
+HERE="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+export LD_LIBRARY_PATH="\$HERE/lib:\${LD_LIBRARY_PATH:-}"
+
+# Optional JNI (libdartjni.so → libjvm.so). Prefer an existing host JDK.
+_jvm_candidates=()
+if [[ -n "\${JAVA_HOME:-}" ]]; then
+  _jvm_candidates+=("\${JAVA_HOME}/lib/server" "\${JAVA_HOME}/lib/amd64/server")
+fi
+_jvm_candidates+=(
+  /usr/lib/jvm/default-java/lib/server
+  /usr/lib/jvm/default/lib/server
+)
+# shellcheck disable=SC2044
+for _d in \$(ls -d /usr/lib/jvm/*/lib/server 2>/dev/null || true); do
+  _jvm_candidates+=("\${_d}")
+done
+for _jvm_dir in "\${_jvm_candidates[@]}"; do
+  if [[ -e "\${_jvm_dir}/libjvm.so" ]]; then
+    export LD_LIBRARY_PATH="\${_jvm_dir}:\${LD_LIBRARY_PATH}"
+    break
+  fi
+done
+unset _jvm_candidates _jvm_dir _d
+
+exec "\$HERE/${EXECUTABLE}" "\$@"
+EOF
+  chmod +x "${APPDIR}/AppRun"
 }
 
 main() {
@@ -307,7 +421,7 @@ main() {
   require_file "${SCRIPT_DIR}/data"
   require_file "${SCRIPT_DIR}/lib"
 
-  # Fix the missing shared lib before assembling AppDir.
+  # Fix packaging gaps before assembling AppDir.
   ensure_onnxruntime_libs "${SCRIPT_DIR}/lib"
 
   rm -rf "${APPDIR}"
@@ -319,13 +433,7 @@ main() {
   cp -a "${SCRIPT_DIR}/data" "${APPDIR}/"
   cp -a "${SCRIPT_DIR}/lib" "${APPDIR}/"
 
-  cat > "${APPDIR}/AppRun" <<EOF
-#!/usr/bin/env bash
-HERE="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-export LD_LIBRARY_PATH="\$HERE/lib:\${LD_LIBRARY_PATH:-}"
-exec "\$HERE/${EXECUTABLE}" "\$@"
-EOF
-  chmod +x "${APPDIR}/AppRun"
+  write_apprun
 
   cat > "${APPDIR}/${APP_NAME}.desktop" <<EOF
 [Desktop Entry]
@@ -345,6 +453,8 @@ EOF
     mkdir -p "${APPDIR}/usr/share/icons/hicolor/256x256/apps"
     cp "${ICON_FILE}" "${APPDIR}/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.${icon_ext}"
   fi
+
+  verify_appdir_deps "${APPDIR}"
 
   download_appimagetool
 
