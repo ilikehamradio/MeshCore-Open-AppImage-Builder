@@ -29,6 +29,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Scheduled runs: skip when this tag is already published.
+          # Manual "Run workflow": always build (e.g. to pick up packaging fixes).
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Manual run; building ${{ steps.upstream.outputs.tag }}."
+            exit 0
+          fi
+
           if gh release view "${{ steps.upstream.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "Already have release ${{ steps.upstream.outputs.tag }}; skipping."
@@ -58,7 +66,18 @@ jobs:
           FILE="MeshcoreOpen-x86_64.AppImage"
           test -f "$FILE"
           test -f "${FILE}.zsync"
-          gh release create "$TAG" "$FILE" "${FILE}.zsync" \
-            --repo "${{ github.repository }}" \
-            --title "MeshCore Open $TAG" \
-            --notes "AppImage built from zjs81/meshcore-open release \`$TAG\`."
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            # Manual rebuild of an existing tag: replace assets in place.
+            gh release upload "$TAG" "$FILE" "${FILE}.zsync" \
+              --repo "${{ github.repository }}" \
+              --clobber
+            gh release edit "$TAG" \
+              --repo "${{ github.repository }}" \
+              --notes "AppImage rebuilt from zjs81/meshcore-open release \`$TAG\`."
+          else
+            gh release create "$TAG" "$FILE" "${FILE}.zsync" \
+              --repo "${{ github.repository }}" \
+              --title "MeshCore Open $TAG" \
+              --notes "AppImage built from zjs81/meshcore-open release \`$TAG\`."
+          fi
