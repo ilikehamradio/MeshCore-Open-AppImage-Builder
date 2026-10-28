@@ -6,6 +6,15 @@ set -euo pipefail
 #   ./build-appimage.sh [app_name] [executable]
 # Example:
 #   ./build-appimage.sh MeshcoreOpen meshcore_open
+#
+# Optional env overrides:
+#   VERSION=1.0.0
+#   ARCH=x86_64
+#   GITHUB_REPO=zjs81/meshcore-open
+#   GITHUB_ASSET_PATTERN='linux.*\.(zip|tar\.gz|tgz)$'
+#   PUBLISH_OWNER=ilikehamradio
+#   PUBLISH_REPO=MeshCore-Open-AppImage-Builder
+#   ONNXRUNTIME_VERSION=1.28.3   # auto-detected from plugin when possible
 
 APP_NAME="${1:-MeshcoreOpen}"
 EXECUTABLE="${2:-meshcore_open}"
@@ -17,6 +26,8 @@ GITHUB_ASSET_PATTERN="${GITHUB_ASSET_PATTERN:-linux.*\.(zip|tar\.gz|tgz)$}"
 # Where YOUR AppImages are published (for Gear Lever auto-updates)
 PUBLISH_OWNER="${PUBLISH_OWNER:-ilikehamradio}"
 PUBLISH_REPO="${PUBLISH_REPO:-MeshCore-Open-AppImage-Builder}"
+# flutter_onnxruntime currently vendors 1.28.3; override if upstream bumps it.
+ONNXRUNTIME_VERSION="${ONNXRUNTIME_VERSION:-}"
 
 APPDIR="${SCRIPT_DIR}/${APP_NAME}.AppDir"
 APPIMAGE_TOOL="${SCRIPT_DIR}/appimagetool-${ARCH}.AppImage"
@@ -175,6 +186,93 @@ for pattern in patterns:
   cp -a "${bundle_root}/lib" "${SCRIPT_DIR}/lib"
 }
 
+detect_onnxruntime_version() {
+  local plugin="${SCRIPT_DIR}/lib/libflutter_onnxruntime_plugin.so"
+  local detected=""
+
+  if [[ -n "${ONNXRUNTIME_VERSION}" ]]; then
+    echo "${ONNXRUNTIME_VERSION}"
+    return
+  fi
+
+  if [[ -f "${plugin}" ]] && command -v strings >/dev/null 2>&1; then
+    detected="$(
+      strings "${plugin}" \
+        | sed -n 's/.*onnxruntime-linux-x64-\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+        | head -n1
+    )"
+  fi
+
+  if [[ -z "${detected}" ]]; then
+    detected="1.28.3"
+    echo "Could not detect ONNX Runtime version from plugin; defaulting to ${detected}" >&2
+  else
+    echo "Detected ONNX Runtime version ${detected} from flutter_onnxruntime plugin" >&2
+  fi
+
+  echo "${detected}"
+}
+
+# Upstream linux zip ships libflutter_onnxruntime_plugin.so but omits
+# libonnxruntime.so.1. Bundle the matching Microsoft release into lib/.
+ensure_onnxruntime_libs() {
+  local lib_dir="${1:-${SCRIPT_DIR}/lib}"
+  local version
+  local arch_tag
+  local tarball_name
+  local url
+  local download_path
+  local extract_dir
+  local src_lib
+
+  if [[ -e "${lib_dir}/libonnxruntime.so.1" || -e "${lib_dir}/libonnxruntime.so" ]]; then
+    echo "ONNX Runtime already present in ${lib_dir}; leaving as-is"
+    return
+  fi
+
+  if [[ ! -f "${lib_dir}/libflutter_onnxruntime_plugin.so" ]]; then
+    echo "No flutter_onnxruntime plugin found; skipping ONNX Runtime bundle"
+    return
+  fi
+
+  version="$(detect_onnxruntime_version)"
+  case "${ARCH}" in
+    x86_64|amd64) arch_tag="x64" ;;
+    aarch64|arm64) arch_tag="aarch64" ;;
+    *)
+      echo "Unsupported ARCH=${ARCH} for ONNX Runtime download" >&2
+      exit 1
+      ;;
+  esac
+
+  tarball_name="onnxruntime-linux-${arch_tag}-${version}.tgz"
+  url="https://github.com/microsoft/onnxruntime/releases/download/v${version}/${tarball_name}"
+  download_path="${SCRIPT_DIR}/.${tarball_name}"
+  extract_dir="${SCRIPT_DIR}/.onnxruntime-extract"
+
+  echo "Bundling missing ONNX Runtime ${version} from: ${url}"
+  rm -rf "${extract_dir}" "${download_path}"
+  mkdir -p "${extract_dir}"
+  curl -fL "${url}" -o "${download_path}"
+  tar -xzf "${download_path}" -C "${extract_dir}"
+
+  src_lib="$(find "${extract_dir}" -type d -path "*/lib" | head -n1)"
+  if [[ -z "${src_lib}" ]]; then
+    echo "ONNX Runtime tarball did not contain a lib/ directory" >&2
+    exit 1
+  fi
+
+  # Real .so plus soname/symlink aliases the dynamic linker expects.
+  cp -a "${src_lib}"/libonnxruntime.so* "${lib_dir}/"
+  if [[ -f "${src_lib}/libonnxruntime_providers_shared.so" ]]; then
+    cp -a "${src_lib}/libonnxruntime_providers_shared.so" "${lib_dir}/"
+  fi
+
+  require_file "${lib_dir}/libonnxruntime.so.1"
+  echo "Installed ONNX Runtime into ${lib_dir}:"
+  ls -l "${lib_dir}"/libonnxruntime.so* "${lib_dir}"/libonnxruntime_providers_shared.so 2>/dev/null || true
+}
+
 resolve_icon() {
   # Prefer the exact project icon from GitHub.
   local candidates=(
@@ -208,6 +306,9 @@ main() {
   require_file "${SCRIPT_DIR}/${EXECUTABLE}"
   require_file "${SCRIPT_DIR}/data"
   require_file "${SCRIPT_DIR}/lib"
+
+  # Fix the missing shared lib before assembling AppDir.
+  ensure_onnxruntime_libs "${SCRIPT_DIR}/lib"
 
   rm -rf "${APPDIR}"
   mkdir -p "${APPDIR}"
