@@ -141,6 +141,11 @@ ensure_onnxruntime_libs() {
   local extract_dir
   local src_lib
 
+  if [[ -e "${lib_dir}/libonnxruntime.so" && ! -e "${lib_dir}/libonnxruntime.so.1" ]]; then
+    # Plugin bundles the lib as libonnxruntime.so; its soname is .so.1.
+    ln -s libonnxruntime.so "${lib_dir}/libonnxruntime.so.1"
+    echo "Linked libonnxruntime.so.1 -> libonnxruntime.so in ${lib_dir}"
+  fi
   if [[ -e "${lib_dir}/libonnxruntime.so.1" || -e "${lib_dir}/libonnxruntime.so" ]]; then
     echo "ONNX Runtime already present in ${lib_dir}; leaving as-is"
     return
@@ -296,6 +301,99 @@ resolve_upstream_tag() {
   echo "${tag}"
 }
 
+# flutter_onnxruntime's CMake downloads onnxruntime-linux-<arch>-<ver>.tgz from
+# github.com/microsoft/onnxruntime and fails if that download is unavailable
+# (it does not check the HTTP status). When GitHub cannot serve it, pre-seed the
+# extraction directory from Microsoft's NuGet package (Microsoft.ML.OnnxRuntime)
+# so CMake finds headers + lib and skips its own download. NuGet does not carry
+# every GitHub patch release, so fall back to the newest NuGet build with the
+# same major.minor (same C API level) when the exact version is missing.
+seed_onnxruntime_for_plugin() {
+  local src_dir="$1"
+  local plugin_root plugin_cmake want arch_tag nuget_rid build_arch
+  local gh_url nuget_ver dest work nupkg
+
+  plugin_root="$(python3 - "${src_dir}/.dart_tool/package_config.json" <<'PY' || true
+import json, sys
+from urllib.parse import urlparse, unquote
+cfg = json.load(open(sys.argv[1]))
+for pkg in cfg.get("packages", []):
+    if pkg.get("name") == "flutter_onnxruntime":
+        uri = pkg["rootUri"]
+        print(unquote(urlparse(uri).path) if uri.startswith("file:") else uri)
+PY
+)"
+  if [[ -z "${plugin_root}" ]]; then
+    echo "flutter_onnxruntime not in dependencies; no ONNX Runtime seeding needed"
+    return
+  fi
+  plugin_cmake="${plugin_root}/linux/CMakeLists.txt"
+  if [[ ! -f "${plugin_cmake}" ]]; then
+    echo "flutter_onnxruntime has no linux/CMakeLists.txt; skipping ONNX Runtime seeding"
+    return
+  fi
+
+  want="${ONNXRUNTIME_VERSION:-$(sed -n 's/.*set(ONNXRUNTIME_VERSION "\([0-9.]*\)").*/\1/p' "${plugin_cmake}" | head -n1)}"
+  if [[ -z "${want}" ]]; then
+    echo "Could not determine flutter_onnxruntime's ONNX Runtime version; leaving CMake to download" >&2
+    return
+  fi
+
+  case "${ARCH}" in
+    x86_64|amd64) arch_tag="x64"; nuget_rid="linux-x64"; build_arch="x64" ;;
+    aarch64|arm64) arch_tag="aarch64"; nuget_rid="linux-arm64"; build_arch="arm64" ;;
+    *) echo "Unsupported ARCH=${ARCH} for ONNX Runtime" >&2; exit 1 ;;
+  esac
+
+  gh_url="https://github.com/microsoft/onnxruntime/releases/download/v${want}/onnxruntime-linux-${arch_tag}-${want}.tgz"
+  if curl -fsIL -o /dev/null "${gh_url}"; then
+    echo "ONNX Runtime ${want} available from GitHub; plugin will download it itself"
+    return
+  fi
+  echo "ONNX Runtime ${want} not downloadable from GitHub (${gh_url}); seeding from NuGet"
+
+  nuget_ver="$(curl -fsSL https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/index.json \
+    | python3 -c '
+import json, sys
+want = sys.argv[1]
+wmaj, wmin, wpat = (int(x) for x in want.split("."))
+best = None
+for v in json.load(sys.stdin)["versions"]:
+    parts = v.split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        continue  # skip pre-releases
+    maj, mn, pat = map(int, parts)
+    if (maj, mn) == (wmaj, wmin) and pat <= wpat and (best is None or pat > best[2]):
+        best = (maj, mn, pat)
+print(".".join(map(str, best)) if best else "")
+' "${want}")"
+  if [[ -z "${nuget_ver}" ]]; then
+    echo "No NuGet Microsoft.ML.OnnxRuntime release compatible with ${want}" >&2
+    exit 1
+  fi
+  if [[ "${nuget_ver}" != "${want}" ]]; then
+    echo "Using NuGet ONNX Runtime ${nuget_ver} (same API level as ${want})"
+  fi
+
+  # Directory name must match what the plugin's CMake computes from ${want}.
+  dest="${src_dir}/build/linux/${build_arch}/release/plugins/flutter_onnxruntime/onnxruntime/onnxruntime-linux-${arch_tag}-${want}"
+  work="${SCRIPT_DIR}/.onnxruntime-nuget"
+  nupkg="${work}/ort.nupkg"
+  rm -rf "${work}" "${dest}"
+  mkdir -p "${work}" "${dest}/include" "${dest}/lib"
+  curl -fL -o "${nupkg}" \
+    "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${nuget_ver}/microsoft.ml.onnxruntime.${nuget_ver}.nupkg"
+  unzip -q "${nupkg}" 'build/native/include/*' "runtimes/${nuget_rid}/native/*" -d "${work}"
+
+  cp -a "${work}/build/native/include/." "${dest}/include/"
+  cp -a "${work}/runtimes/${nuget_rid}/native/." "${dest}/lib/"
+  require_file "${dest}/include/onnxruntime_cxx_api.h"
+  require_file "${dest}/lib/libonnxruntime.so"
+  ln -sf libonnxruntime.so "${dest}/lib/libonnxruntime.so.1"
+  rm -rf "${work}"
+  echo "Seeded ONNX Runtime into ${dest}"
+}
+
 build_from_patched_source() {
   local tag="$1"
   local src_dir="${SCRIPT_DIR}/.upstream-src"
@@ -322,6 +420,10 @@ build_from_patched_source() {
   (
     cd "${src_dir}"
     "${flutter_bin}" pub get
+  )
+  seed_onnxruntime_for_plugin "${src_dir}"
+  (
+    cd "${src_dir}"
     "${flutter_bin}" build linux --release --no-pub
   )
 
