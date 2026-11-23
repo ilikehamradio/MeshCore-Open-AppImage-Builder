@@ -57,11 +57,24 @@ jobs:
           sudo apt-get install -y curl unzip fuse libfuse2 python3 \
             git clang cmake ninja-build pkg-config libgtk-3-dev
 
+      # Upstream pins an exact Flutter release in pubspec.yaml (environment.flutter)
+      # and pub get refuses any other version, so install exactly that one.
+      - name: Fetch upstream pubspec for Flutter version
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .upstream-pubspec
+          gh api "repos/zjs81/meshcore-open/contents/pubspec.yaml?ref=${{ steps.upstream.outputs.tag }}" \
+            -H "Accept: application/vnd.github.raw" > .upstream-pubspec/pubspec.yaml
+          grep -E '^\s+flutter:' .upstream-pubspec/pubspec.yaml || echo "No pinned Flutter version; using latest stable."
+
       - name: Setup Flutter
         if: steps.check.outputs.exists == 'false'
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version-file: .upstream-pubspec/pubspec.yaml
           cache: true
 
       - name: Build AppImage from patched upstream source
