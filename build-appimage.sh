@@ -424,7 +424,11 @@ build_from_patched_source() {
   seed_onnxruntime_for_plugin "${src_dir}"
   (
     cd "${src_dir}"
-    "${flutter_bin}" build linux --release --no-pub
+    # Upstream now packages its own AppImage during the Release install step
+    # (and, on hosts with a newer glibc than its baseline, rebuilds the whole
+    # app inside a Podman/Docker Ubuntu container). We package ourselves, so
+    # skip that and just produce the plain Flutter bundle.
+    MESHCORE_BUILD_APPIMAGE=0 "${flutter_bin}" build linux --release --no-pub
   )
 
   bundle_dir="${src_dir}/build/linux/x64/release/bundle"
